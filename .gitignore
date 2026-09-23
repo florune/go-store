@@ -1,0 +1,4 @@
+*.out
+coverage.txt
+.idea/
+.vscode/
