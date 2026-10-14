@@ -3,17 +3,35 @@
 package store
 
 import (
+	"fmt"
 	"hash/maphash"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// epoch anchors the store clock. time.Since reads the monotonic clock, so TTLs
+// are unaffected by wall-clock adjustments.
+var epoch = time.Now()
+
+func monotonicNow() int64 { return int64(time.Since(epoch)) }
+
+// entry is immutable once published, apart from its atomic fields. Changing a
+// key's value or expiry replaces its entry, so readers may use an entry after
+// releasing the shard lock.
 type entry[V any] struct {
 	value     V
-	expiresAt int64
+	expiresAt int64 // zero means the entry never expires
 	cost      int64
-	accessed  atomic.Int64
+	// absent marks a cached "no value" result from a Loader.
+	absent     bool
+	accessed   atomic.Int64
+	refreshing atomic.Bool
+}
+
+func isLive[V any](e *entry[V], now int64) bool {
+	return e.expiresAt == 0 || now < e.expiresAt
 }
 
 type shard[K comparable, V any] struct {
@@ -33,49 +51,90 @@ func (sh *shard[K, V]) invalidateFlight(key K) {
 // Stats is a point-in-time snapshot of store activity.
 type Stats struct {
 	Hits, Misses, Evictions, Loads, LoadErrors uint64
-	Entries                                    int
-	Cost                                       int64
+	// NegativeHits counts lookups answered by a cached absence (WithNegativeTTL).
+	NegativeHits uint64
+	// StaleFallbacks counts failed loads that returned the previous value
+	// instead of the error (WithStaleOnError).
+	StaleFallbacks uint64
+	// Refreshes counts background loads started by WithRefreshAhead.
+	Refreshes uint64
+	Entries   int
+	Cost      int64
 }
 
 // Store is a concurrency-safe, typed in-memory key/value store. Values use Go
 // assignment semantics: callers must not mutate shared maps, pointers, slices,
 // or reference-bearing fields concurrently. Use Bytes for owned byte slices.
 type Store[K comparable, V any] struct {
-	seed    maphash.Seed
-	shards  []shard[K, V]
-	mask    uint64
-	maxCost int64
-	costFn  func(K, V) int64
-	onEvict func(K, V, EvictionReason)
+	seed         maphash.Seed
+	shards       []shard[K, V]
+	mask         uint64
+	name         string
+	maxCost      int64
+	costFn       func(K, V) int64
+	onEvict      func(K, V, EvictionReason)
+	jitter       float64
+	negativeTTL  time.Duration
+	loadTimeout  time.Duration
+	staleGrace   int64
+	refreshAhead int64
+	clock        func() int64
 
-	cost      atomic.Int64
-	hits      atomic.Uint64
-	misses    atomic.Uint64
-	evictions atomic.Uint64
-	loads     atomic.Uint64
-	loadErrs  atomic.Uint64
+	cost           atomic.Int64
+	hits           atomic.Uint64
+	misses         atomic.Uint64
+	evictions      atomic.Uint64
+	loads          atomic.Uint64
+	loadErrs       atomic.Uint64
+	negativeHits   atomic.Uint64
+	staleFallbacks atomic.Uint64
+	refreshes      atomic.Uint64
 
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-// New constructs a store. Call Close when periodic cleanup is enabled.
-func New[K comparable, V any](options ...Option[K, V]) (*Store[K, V], error) {
-	c := config[K, V]{shards: defaultShards}
+// New constructs a store. Call Close when it is no longer needed: it stops
+// periodic cleanup and releases the store's name.
+func New[K comparable, V any](options ...Option) (*Store[K, V], error) {
+	c := storeConfig{shards: defaultShards}
 	for _, option := range options {
-		if err := option(&c); err != nil {
+		if err := option.applyStore(&c); err != nil {
 			return nil, err
 		}
 	}
+	var costFn func(K, V) int64
+	if c.cost != nil {
+		fn, ok := c.cost.(func(K, V) int64)
+		if !ok {
+			return nil, fmt.Errorf("store: WithMaxCost cost function is %T, want %T", c.cost, fn)
+		}
+		costFn = fn
+	}
+	var onEvict func(K, V, EvictionReason)
+	if c.onEvict != nil {
+		fn, ok := c.onEvict.(func(K, V, EvictionReason))
+		if !ok {
+			return nil, fmt.Errorf("store: WithEvictionCallback callback is %T, want %T", c.onEvict, fn)
+		}
+		onEvict = fn
+	}
 	s := &Store[K, V]{
 		seed: maphash.MakeSeed(), shards: make([]shard[K, V], c.shards),
-		mask: uint64(c.shards - 1), maxCost: c.maxCost, costFn: c.cost,
-		onEvict: c.onEvict,
+		mask: uint64(c.shards - 1), name: c.name, maxCost: c.maxCost, costFn: costFn,
+		onEvict: onEvict, jitter: c.jitter, negativeTTL: c.negativeTTL,
+		loadTimeout: c.loadTimeout, staleGrace: int64(c.staleGrace),
+		refreshAhead: int64(c.refreshAhead), clock: monotonicNow,
 	}
 	for i := range s.shards {
 		s.shards[i].items = make(map[K]*entry[V])
 		s.shards[i].flights = make(map[K]*flight[V])
+	}
+	if s.name != "" {
+		if err := register(s.name, func() any { return s.Stats() }); err != nil {
+			return nil, err
+		}
 	}
 	if c.cleanupInterval > 0 {
 		s.stop, s.done = make(chan struct{}), make(chan struct{})
@@ -85,31 +144,46 @@ func New[K comparable, V any](options ...Option[K, V]) (*Store[K, V], error) {
 }
 
 // MustNew is New with option errors promoted to panics.
-func MustNew[K comparable, V any](options ...Option[K, V]) *Store[K, V] {
-	s, err := New(options...)
+func MustNew[K comparable, V any](options ...Option) *Store[K, V] {
+	s, err := New[K, V](options...)
 	if err != nil {
 		panic(err)
 	}
 	return s
 }
 
+// Name returns the name given by WithName, or "".
+func (s *Store[K, V]) Name() string { return s.name }
+
 func (s *Store[K, V]) shardFor(key K) *shard[K, V] {
 	return &s.shards[maphash.Comparable(s.seed, key)&s.mask]
 }
 
-func expiry(ttl time.Duration, now int64) int64 {
+// expiry returns the expiry for ttl, spread by the configured jitter.
+func (s *Store[K, V]) expiry(ttl time.Duration, now int64) int64 {
 	if ttl <= 0 {
 		return 0
+	}
+	if s.jitter > 0 {
+		ttl += time.Duration(rand.Int64N(int64(float64(ttl)*s.jitter) + 1))
 	}
 	return now + int64(ttl)
 }
 
-func isExpired[V any](e *entry[V], now int64) bool {
-	return e.expiresAt > 0 && now >= e.expiresAt
+// reclaimable reports whether an entry is expired and past the stale grace
+// period, so it can no longer serve as a fallback.
+func (s *Store[K, V]) reclaimable(e *entry[V], now int64) bool {
+	return e.expiresAt > 0 && now >= e.expiresAt+s.staleGrace
 }
 
-func newEntry[V any](value V, ttl time.Duration, now, cost int64) *entry[V] {
-	e := &entry[V]{value: value, expiresAt: expiry(ttl, now), cost: cost}
+func (s *Store[K, V]) newEntry(value V, ttl time.Duration, now, cost int64) *entry[V] {
+	e := &entry[V]{value: value, expiresAt: s.expiry(ttl, now), cost: cost}
+	e.accessed.Store(now)
+	return e
+}
+
+func (s *Store[K, V]) newAbsentEntry(now int64) *entry[V] {
+	e := &entry[V]{expiresAt: s.expiry(s.negativeTTL, now), cost: 1, absent: true}
 	e.accessed.Store(now)
 	return e
 }
@@ -130,7 +204,7 @@ func (s *Store[K, V]) Set(key K, value V, ttl time.Duration) bool {
 	if !fits {
 		return false
 	}
-	e := newEntry(value, ttl, time.Now().UnixNano(), cost)
+	e := s.newEntry(value, ttl, s.clock(), cost)
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	old := sh.items[key]
@@ -146,71 +220,70 @@ func (s *Store[K, V]) Set(key K, value V, ttl time.Duration) bool {
 	return true
 }
 
-// SetNX stores value only when key has no live value.
+// SetNX stores value only when key has no live value. A cached absence does
+// not count as a value.
 func (s *Store[K, V]) SetNX(key K, value V, ttl time.Duration) bool {
 	cost, fits := s.costOf(key, value)
 	if !fits {
 		return false
 	}
-	now := time.Now().UnixNano()
+	now := s.clock()
 	sh := s.shardFor(key)
-	var expired *entry[V]
 	sh.mu.Lock()
-	if current := sh.items[key]; current != nil {
-		if !isExpired(current, now) {
-			sh.mu.Unlock()
-			return false
-		}
-		expired = current
+	old := sh.items[key]
+	if old != nil && isLive(old, now) && !old.absent {
+		sh.mu.Unlock()
+		return false
 	}
-	sh.items[key] = newEntry(value, ttl, now, cost)
+	sh.items[key] = s.newEntry(value, ttl, now, cost)
 	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	delta := cost
-	if expired != nil {
-		delta -= expired.cost
-		s.evicted(key, expired, Expired)
+	if old != nil {
+		delta -= old.cost
+		if !isLive(old, now) {
+			s.evicted(key, old, Expired)
+		}
 	}
 	s.cost.Add(delta)
 	s.enforceCapacity()
 	return true
 }
 
-// Get returns a live value and updates its recency.
+// Get returns a live value and updates its recency. A cached absence is
+// reported as a miss.
 func (s *Store[K, V]) Get(key K) (V, bool) {
-	value, ok := s.lookup(key)
-	if ok {
+	if e := s.peek(key, s.clock()); e != nil && !e.absent {
 		s.hits.Add(1)
-	} else {
-		s.misses.Add(1)
+		return e.value, true
 	}
-	return value, ok
+	s.misses.Add(1)
+	var zero V
+	return zero, false
 }
 
-// lookup is Get without hit and miss accounting.
-func (s *Store[K, V]) lookup(key K) (V, bool) {
+// peek returns key's live entry and records the access. An expired entry is
+// removed once it is past the stale grace period.
+func (s *Store[K, V]) peek(key K, now int64) *entry[V] {
 	sh := s.shardFor(key)
 	sh.mu.RLock()
 	e := sh.items[key]
-	if e == nil {
-		sh.mu.RUnlock()
-		var zero V
-		return zero, false
-	}
-	now := time.Now().UnixNano()
-	if isExpired(e, now) {
-		sh.mu.RUnlock()
-		s.removeIfSame(key, e, Expired)
-		var zero V
-		return zero, false
-	}
-	value := e.value
-	e.accessed.Store(now)
 	sh.mu.RUnlock()
-	return value, true
+	if e == nil {
+		return nil
+	}
+	if isLive(e, now) {
+		e.accessed.Store(now)
+		return e
+	}
+	if s.reclaimable(e, now) {
+		s.removeIfSame(key, e, Expired)
+	}
+	return nil
 }
 
-// Delete removes key and reports whether a live or expired entry existed.
+// Delete removes key and reports whether an entry existed. Any load of key
+// already in flight will not store its result.
 func (s *Store[K, V]) Delete(key K) bool {
 	sh := s.shardFor(key)
 	sh.mu.Lock()
@@ -226,55 +299,50 @@ func (s *Store[K, V]) Delete(key K) bool {
 	return e != nil
 }
 
-// Expire changes a live key's TTL. A non-positive TTL removes expiration.
-func (s *Store[K, V]) Expire(key K, ttl time.Duration) bool {
-	now := time.Now().UnixNano()
-	sh := s.shardFor(key)
-	sh.mu.Lock()
-	e := sh.items[key]
-	if e == nil || isExpired(e, now) {
-		if e != nil {
-			delete(sh.items, key)
+// Clear removes every entry and keeps loads already in flight from storing
+// their results. Eviction callbacks are not called.
+func (s *Store[K, V]) Clear() {
+	for i := range s.shards {
+		sh := &s.shards[i]
+		var freed int64
+		sh.mu.Lock()
+		for _, e := range sh.items {
+			freed += e.cost
+		}
+		clear(sh.items)
+		for _, call := range sh.flights {
+			call.stale = true
 		}
 		sh.mu.Unlock()
-		if e != nil {
-			s.cost.Add(-e.cost)
-			s.evicted(key, e, Expired)
-		}
-		return false
+		s.cost.Add(-freed)
 	}
-	e.expiresAt = expiry(ttl, now)
-	sh.mu.Unlock()
-	return true
 }
 
-// updateExisting applies fn and refreshes TTL while the key remains pinned in
-// its shard. It is an internal seam used by compound structures.
-func (s *Store[K, V]) updateExisting(key K, ttl time.Duration, fn func(V)) bool {
-	now := time.Now().UnixNano()
+// Expire changes a live key's TTL. A non-positive TTL removes expiration. It
+// returns false for a missing key or a cached absence.
+func (s *Store[K, V]) Expire(key K, ttl time.Duration) bool {
+	now := s.clock()
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	e := sh.items[key]
-	if e == nil {
+	if e == nil || e.absent {
 		sh.mu.Unlock()
 		return false
 	}
-	if isExpired(e, now) {
+	if !isLive(e, now) {
 		delete(sh.items, key)
 		sh.mu.Unlock()
 		s.cost.Add(-e.cost)
 		s.evicted(key, e, Expired)
 		return false
 	}
-	fn(e.value)
-	e.expiresAt = expiry(ttl, now)
-	e.accessed.Store(now)
+	sh.items[key] = s.newEntry(e.value, ttl, now, e.cost)
 	sh.mu.Unlock()
 	return true
 }
 
-// Len returns the current number of entries, including entries that expired
-// since the last lazy or periodic cleanup.
+// Len returns the current number of entries, including cached absences and
+// expired entries not yet reclaimed.
 func (s *Store[K, V]) Len() int {
 	n := 0
 	for i := range s.shards {
@@ -287,15 +355,24 @@ func (s *Store[K, V]) Len() int {
 }
 
 func (s *Store[K, V]) Stats() Stats {
-	return Stats{Hits: s.hits.Load(), Misses: s.misses.Load(), Evictions: s.evictions.Load(), Loads: s.loads.Load(), LoadErrors: s.loadErrs.Load(), Entries: s.Len(), Cost: s.cost.Load()}
+	return Stats{
+		Hits: s.hits.Load(), Misses: s.misses.Load(), Evictions: s.evictions.Load(),
+		Loads: s.loads.Load(), LoadErrors: s.loadErrs.Load(),
+		NegativeHits: s.negativeHits.Load(), StaleFallbacks: s.staleFallbacks.Load(),
+		Refreshes: s.refreshes.Load(), Entries: s.Len(), Cost: s.cost.Load(),
+	}
 }
 
-// Close stops background cleanup. It is safe to call more than once.
+// Close stops background cleanup and releases the store's name. It is safe to
+// call more than once.
 func (s *Store[K, V]) Close() {
 	s.closeOnce.Do(func() {
 		if s.stop != nil {
 			close(s.stop)
 			<-s.done
+		}
+		if s.name != "" {
+			unregister(s.name)
 		}
 	})
 }
@@ -305,8 +382,8 @@ func (s *Store[K, V]) cleanupLoop(interval time.Duration) {
 	defer func() { t.Stop(); close(s.done) }()
 	for {
 		select {
-		case now := <-t.C:
-			s.removeExpired(now.UnixNano())
+		case <-t.C:
+			s.removeExpired(s.clock())
 		case <-s.stop:
 			return
 		}
@@ -322,7 +399,7 @@ func (s *Store[K, V]) removeExpired(now int64) {
 		}
 		sh.mu.Lock()
 		for key, e := range sh.items {
-			if isExpired(e, now) {
+			if s.reclaimable(e, now) {
 				delete(sh.items, key)
 				removed = append(removed, struct {
 					key K
@@ -352,9 +429,11 @@ func (s *Store[K, V]) removeIfSame(key K, target *entry[V], reason EvictionReaso
 	return true
 }
 
+// evicted records an eviction. Cached absences carry no value, so the
+// eviction callback is not called for them.
 func (s *Store[K, V]) evicted(key K, e *entry[V], reason EvictionReason) {
 	s.evictions.Add(1)
-	if s.onEvict != nil {
+	if s.onEvict != nil && !e.absent {
 		s.onEvict(key, e.value, reason)
 	}
 }

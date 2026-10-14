@@ -4,11 +4,11 @@ import "time"
 
 // CompareAndSwap atomically replaces a live comparable value.
 func CompareAndSwap[K comparable, V comparable](s *Store[K, V], key K, old, next V, ttl time.Duration) bool {
-	now := time.Now().UnixNano()
+	now := s.clock()
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	e := sh.items[key]
-	if e == nil || isExpired(e, now) || e.value != old {
+	if e == nil || !isLive(e, now) || e.absent || e.value != old {
 		sh.mu.Unlock()
 		return false
 	}
@@ -17,7 +17,7 @@ func CompareAndSwap[K comparable, V comparable](s *Store[K, V], key K, old, next
 		sh.mu.Unlock()
 		return false
 	}
-	sh.items[key] = newEntry(next, ttl, now, cost)
+	sh.items[key] = s.newEntry(next, ttl, now, cost)
 	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	s.cost.Add(cost - e.cost)
@@ -29,9 +29,10 @@ type Integer interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
 }
 
-// Add atomically adds delta to an integer value. A missing key starts at zero.
+// Add atomically adds delta to an integer value. A missing key, expired key,
+// or cached absence starts at zero.
 func Add[K comparable, V Integer](s *Store[K, V], key K, delta V, ttl time.Duration) V {
-	now := time.Now().UnixNano()
+	now := s.clock()
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	current := sh.items[key]
@@ -39,13 +40,13 @@ func Add[K comparable, V Integer](s *Store[K, V], key K, delta V, ttl time.Durat
 	var oldCost int64
 	if current != nil {
 		oldCost = current.cost
-		if !isExpired(current, now) {
+		if isLive(current, now) && !current.absent {
 			value = current.value
 		}
 	}
 	value += delta
 	cost, _ := s.costOf(key, value)
-	sh.items[key] = newEntry(value, ttl, now, cost)
+	sh.items[key] = s.newEntry(value, ttl, now, cost)
 	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	s.cost.Add(cost - oldCost)

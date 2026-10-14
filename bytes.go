@@ -6,8 +6,8 @@ import "time"
 // callers must treat the returned slice as immutable and short-lived.
 type Bytes[K comparable] struct{ store *Store[K, []byte] }
 
-func NewBytes[K comparable](options ...Option[K, []byte]) (*Bytes[K], error) {
-	s, err := New(options...)
+func NewBytes[K comparable](options ...Option) (*Bytes[K], error) {
+	s, err := New[K, []byte](options...)
 	if err != nil {
 		return nil, err
 	}

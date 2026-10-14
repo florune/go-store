@@ -3,7 +3,8 @@
 `go-store` is a typed, in-process L1 store for Go services that need to avoid
 unnecessary Redis or database round trips. It combines sharded locking, per-key
 TTL, request-coalesced loading, and optional cost-bounded eviction without
-serializing application values.
+serializing application values. `Snapshot` keeps whole datasets, such as
+configuration tables, in memory and reloads them only when they change.
 
 Requires Go 1.24 or newer.
 
@@ -26,7 +27,7 @@ type User struct {
 
 func main() {
 	users := store.MustNew[string, User](
-		store.WithCleanupInterval[string, User](time.Second),
+		store.WithCleanupInterval(time.Second),
 	)
 	defer users.Close()
 
@@ -50,14 +51,45 @@ func main() {
 
 ## Included structures
 
-- `Store[K, V]`: generic key/value storage, TTL, `SetNX`, statistics, and
-  coalesced `GetOrLoad`.
+- `Store[K, V]`: generic key/value storage, TTL, `SetNX`, `Clear`,
+  statistics, and coalesced `GetOrLoad`.
 - `Bytes[K]`: byte storage with defensive copies plus an explicitly unsafe
   zero-copy read view.
-- `Hash[K, F, V]`: Redis-style typed field/value maps with a TTL per top-level
-  key.
-- `Set[K, M]`: Redis-style typed member sets with a TTL per top-level key.
+- `Snapshot[T]`: one value loaded as a whole and kept current in the
+  background.
 - `CompareAndSwap` and `Add`: atomic helpers for comparable and integer values.
+
+Type parameters appear only on constructors such as `New[K, V]`. Options are
+plain values; `WithMaxCost` and `WithEvictionCallback` infer their types from
+the function you pass, and `New` rejects one whose types do not match.
+
+## Snapshots
+
+A `Snapshot` suits data that is read on every request but changes rarely, such
+as a configuration table published to Redis as one large JSON value. `Get`
+returns the in-memory value with no I/O; a background poll checks a cheap
+version and reloads the value only when the version changes.
+
+```go
+gameLib := store.MustNewSnapshot(loadGameLib, // func(context.Context) ([]GameLib, error)
+	store.WithName("game_lib"),
+	store.WithVersion(loadGameLibMD5), // func(context.Context) (string, error)
+	store.WithLoadTimeout(2*time.Second),
+)
+defer gameLib.Close()
+
+libs, err := gameLib.Get(ctx) // shared value: do not modify it
+```
+
+- The first `Get` loads the value; concurrent first calls share one load.
+  `Get` returns an error only while no value has been loaded.
+- The version is polled every `WithPollInterval` (default 1s). The value is
+  also reloaded every `WithMaxAge` (default 5m, zero disables), which is the
+  only reload trigger when no version is configured.
+- A failed reload or version check keeps the previous value; see
+  `SnapshotStats`.
+- `Invalidate` forces a background reload, for example when an invalidation
+  message arrives.
 
 ## Loading
 
@@ -73,8 +105,26 @@ func main() {
   receive the loaded value.
 - A loader panic is returned to every waiting caller as `*LoaderPanicError`
   and does not block later loads of the key.
-- `ok=false` results and values larger than `MaxCost` are returned but not
-  stored.
+- Values larger than `MaxCost` are returned but not stored.
+
+Options tune loading for an L1 cache in front of Redis or a database:
+
+| Option | Effect |
+| --- | --- |
+| `WithNegativeTTL(d)` | Stores an `ok=false` result for `d`, so lookups of a missing key stop reaching the loader. Errors are never cached. |
+| `WithLoadTimeout(d)` | Bounds each loader call. |
+| `WithStaleOnError(grace)` | Keeps expired entries for `grace`; if a reload fails, callers get the old value instead of the error. `Get` never returns expired values. |
+| `WithRefreshAhead(window)` | When a hit has less than `window` to live, reloads it in the background and returns the current value immediately. |
+| `WithTTLJitter(f)` | Lengthens each TTL by up to `f*TTL` so entries written together do not expire together. |
+
+```go
+banned := store.MustNew[int64, struct{}](
+	store.WithName("account_ban"),
+	store.WithNegativeTTL(30*time.Second), // most users are not banned
+	store.WithLoadTimeout(200*time.Millisecond),
+	store.WithStaleOnError(time.Minute),
+)
+```
 
 ## Capacity control
 
@@ -84,7 +134,7 @@ least recently accessed candidate.
 
 ```go
 cache := store.MustNew[string, User](
-	store.WithMaxCost[string, User](10_000, func(_ string, _ User) int64 {
+	store.WithMaxCost(10_000, func(_ string, _ User) int64 {
 		return 1
 	}),
 )
@@ -108,9 +158,19 @@ retain it longer than necessary.
 ## TTL and cleanup
 
 A TTL greater than zero sets an expiry. Zero or negative TTL means the entry
-does not expire. Expired values are never returned. They are removed lazily on
-access and, when `WithCleanupInterval` is configured, by a background pass.
-Call `Close` to stop that background goroutine.
+does not expire. TTLs use the monotonic clock, so wall-clock adjustments do not
+affect them. Expired values are never returned by `Get`. They are removed
+lazily on access and, when `WithCleanupInterval` is configured, by a background
+pass; with `WithStaleOnError`, only after the grace period. Call `Close` to
+stop that background goroutine.
+
+## Metrics
+
+`Stats` reports hits, misses, cached-absence hits, loads, load errors, stale
+fallbacks, background refreshes, evictions, entries, and cost. Stores created
+`WithName`, and snapshots created with it, appear in `AllStats()`, and
+`PublishExpvar()` exposes them as the expvar variable `go_store`. Names must be
+unique among open stores and snapshots; `Close` releases them.
 
 ## Concurrency notes
 

@@ -195,7 +195,7 @@ func TestGetOrLoadStats(t *testing.T) {
 }
 
 func TestGetOrLoadReturnsValueTooCostlyToStore(t *testing.T) {
-	s := store.MustNew[string, string](store.WithMaxCost[string, string](3, func(_, v string) int64 {
+	s := store.MustNew[string, string](store.WithMaxCost(3, func(_, v string) int64 {
 		return int64(len(v))
 	}))
 	got, ok, err := s.GetOrLoad(context.Background(), "k", 0, func(context.Context, string) (string, bool, error) {

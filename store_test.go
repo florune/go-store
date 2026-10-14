@@ -16,7 +16,7 @@ type user struct {
 }
 
 func TestTypedStoreAndExpiration(t *testing.T) {
-	s := store.MustNew[string, user](store.WithCleanupInterval[string, user](time.Millisecond))
+	s := store.MustNew[string, user](store.WithCleanupInterval(time.Millisecond))
 	defer s.Close()
 	want := user{Name: "Ada", Age: 37}
 	if !s.Set("user:1", want, 5*time.Millisecond) {
@@ -70,7 +70,7 @@ func TestGetOrLoadCoalesces(t *testing.T) {
 }
 
 func TestCapacity(t *testing.T) {
-	s := store.MustNew[string, string](store.WithMaxCost[string, string](2, func(_, _ string) int64 { return 1 }))
+	s := store.MustNew[string, string](store.WithMaxCost(2, func(_, _ string) int64 { return 1 }))
 	for _, key := range []string{"a", "b", "c"} {
 		s.Set(key, key, 0)
 	}
@@ -92,27 +92,6 @@ func TestBytesOwnership(t *testing.T) {
 	again, _ := b.Get("k")
 	if string(again) != "abc" {
 		t.Fatalf("stored bytes mutated: %q", again)
-	}
-}
-
-func TestHashAndSet(t *testing.T) {
-	h := store.NewHash[string, string, user]()
-	if !h.Set("team", "lead", user{Name: "Ada"}, time.Minute) {
-		t.Fatal("field not added")
-	}
-	if h.Set("team", "lead", user{Name: "Grace"}, time.Minute) {
-		t.Fatal("replacement reported as add")
-	}
-	if got, ok := h.Get("team", "lead"); !ok || got.Name != "Grace" {
-		t.Fatalf("hash get = %#v, %v", got, ok)
-	}
-
-	s := store.NewSet[string, int]()
-	if !s.Add("ids", 7, time.Minute) || s.Add("ids", 7, time.Minute) {
-		t.Fatal("set add semantics broken")
-	}
-	if !s.Contains("ids", 7) || !s.Remove("ids", 7) {
-		t.Fatal("set membership broken")
 	}
 }
 
@@ -143,6 +122,23 @@ func BenchmarkStoreParallel(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			s.Get(i & 1023)
+			i++
+		}
+	})
+}
+
+func BenchmarkGetOrLoadHitParallel(b *testing.B) {
+	s := store.MustNew[int, int](store.WithRefreshAhead(time.Second))
+	for i := range 1024 {
+		s.Set(i, i, time.Hour)
+	}
+	loader := func(_ context.Context, key int) (int, bool, error) { return key, true, nil }
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			s.GetOrLoad(ctx, i&1023, time.Hour, loader)
 			i++
 		}
 	})
