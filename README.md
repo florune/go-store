@@ -1,229 +1,171 @@
 # go-store
 
-`go-store` is a typed, in-process L1 store for Go services that need to avoid
-unnecessary Redis or database round trips. It combines sharded locking, per-key
-TTL, request-coalesced loading, and optional cost-bounded eviction without
-serializing application values. `Snapshot` keeps whole datasets, such as
-configuration tables, in memory and reloads them only when they change.
+English | [简体中文](README.zh-CN.md)
 
-Requires Go 1.24 or newer.
+`go-store` is a typed, in-process L1 cache for Go services that sit in front of
+Redis or a database. It keeps hot data in memory, coalesces concurrent loads,
+and keeps several processes consistent through Redis pub/sub, so that most
+reads never leave the process.
 
-## Quick start
+- **`Store[K, V]`**: per-key cache with TTLs, read-through loading, negative
+  caching, stale-on-error, refresh-ahead, and optional cost-bounded eviction.
+- **`Snapshot[T]`**: a whole dataset, such as a configuration table, held in
+  memory and reloaded only when its version changes. Reads are lock-free.
+- **`redisbus`**: broadcasts invalidations so that every process drops or
+  reloads its copy after a write.
 
-```go
-package main
+Values are stored as Go values, never serialized. Type parameters appear only
+on constructors; options are plain values. Requires Go 1.24 or newer.
 
-import (
-	"context"
-	"time"
-
-	store "github.com/florune/go-store"
-)
-
-type User struct {
-	ID   int64
-	Name string
-}
-
-func main() {
-	users := store.MustNew[string, User](
-		store.WithCleanupInterval(time.Second),
-	)
-	defer users.Close()
-
-	users.Set("user:42", User{ID: 42, Name: "Ada"}, time.Minute)
-	user, ok := users.Get("user:42")
-	_, _ = user, ok
-
-	user, ok, err := users.GetOrLoad(
-		context.Background(),
-		"user:43",
-		time.Minute,
-		func(ctx context.Context, key string) (User, bool, error) {
-			// Load from Redis or a database. Concurrent misses for this key
-			// share this one call.
-			return User{ID: 43, Name: "Grace"}, true, nil
-		},
-	)
-	_, _, _ = user, ok, err
-}
+```sh
+go get github.com/florune/go-store
 ```
 
-## Included structures
+Full API reference: [docs/API.md](docs/API.md) ([中文](docs/API.zh-CN.md)).
 
-- `Store[K, V]`: generic key/value storage, TTL, `SetNX`, `Clear`,
-  statistics, and coalesced `GetOrLoad`.
-- `Bytes[K]`: byte storage with defensive copies plus an explicitly unsafe
-  zero-copy read view.
-- `Snapshot[T]`: one value loaded as a whole and kept current in the
-  background.
-- `CompareAndSwap` and `Add`: atomic helpers for comparable and integer values.
-- `redisbus`: invalidation broadcast over Redis pub/sub for the above.
+## Choosing a type
 
-Type parameters appear only on constructors such as `New[K, V]`. Options are
-plain values; `WithMaxCost` and `WithEvictionCallback` infer their types from
-the function you pass, and `New` rejects one whose types do not match.
+| Data | Use | Example |
+| --- | --- | --- |
+| Read on every request, changes rarely, loaded as one value | `Snapshot` | Game library, lobby menus, VIP levels, `config_kv` |
+| Per-key, read often, changes occasionally | `Store` + `GetOrLoad` | User profile, ban flag, channel version |
+| Must change everywhere at once after a write | Either, bound to `redisbus` | User profile after login or ban |
+| Strongly consistent or atomic shared state | **Do not cache in L1** | Wallet balance, locks, Lua counters, idempotency keys |
 
-## Snapshots
+## Store: read-through cache
 
-A `Snapshot` suits data that is read on every request but changes rarely, such
-as a configuration table published to Redis as one large JSON value. `Get`
-returns the in-memory value with no I/O; a background poll checks a cheap
-version and reloads the value only when the version changes.
+```go
+users := store.MustNew[int64, User](
+	store.WithName("user_info"),
+	store.WithMaxCost(100_000, func(int64, User) int64 { return 1 }), // at most 100k users
+	store.WithNegativeTTL(30*time.Second),  // cache "not found" too
+	store.WithLoadTimeout(2*time.Second),   // bound each load
+	store.WithStaleOnError(time.Minute),    // serve the old value if a reload fails
+	store.WithTTLJitter(0.1),               // spread expiries
+)
+defer users.Close()
+
+user, ok, err := users.GetOrLoad(ctx, uid, 5*time.Minute,
+	func(ctx context.Context, uid int64) (User, bool, error) {
+		u, err := repo.FindUser(ctx, uid) // Redis, then the database
+		if errors.Is(err, ErrNotFound) {
+			return User{}, false, nil // ok=false: absent, cached for 30s
+		}
+		return u, err == nil, err // errors are never cached
+	})
+```
+
+`GetOrLoad` guarantees:
+
+- Concurrent misses for one key share a single loader call.
+- The loader runs with the first caller's context values but not its
+  cancellation; it is canceled only when every waiting caller has given up.
+  One caller timing out never fails the others.
+- A `Set`, `SetNX`, `CompareAndSwap`, `Add`, `Delete`, or `Clear` of the key
+  while a load is in flight keeps that load's result out of the cache, so an
+  invalidation is never overwritten by data read before it.
+- A loader panic is returned as `*LoaderPanicError` and never blocks the key.
+- With `WithStaleOnError`, a failed reload returns the expired value with a
+  **nil error**; the failure shows only in `Stats` (`LoadErrors`,
+  `StaleFallbacks`).
+- With `WithRefreshAhead(window)`, a hit within `window` of expiry returns at
+  once and reloads in the background.
+
+`Store` also offers `Get`, `Set`, `SetNX`, `Delete`, `Expire`, `Clear`, and the
+atomic helpers `CompareAndSwap` and `Add`. `SetNX` with a short TTL doubles as
+a local write throttle, for example to refresh an online marker at most once
+per 30 seconds per user.
+
+## Snapshot: whole datasets
 
 ```go
 gameLib := store.MustNewSnapshot(loadGameLib, // func(context.Context) ([]GameLib, error)
 	store.WithName("game_lib"),
-	store.WithVersion(loadGameLibMD5), // func(context.Context) (string, error)
-	store.WithLoadTimeout(2*time.Second),
+	store.WithVersion(loadGameLibMD5), // func(context.Context) (string, error), polled every second
 )
 defer gameLib.Close()
 
-libs, err := gameLib.Get(ctx) // shared value: do not modify it
+libs, err := gameLib.Get(ctx) // in memory; the slice is shared, do not modify it
 ```
 
-- The first `Get` loads the value; concurrent first calls share one load.
-  `Get` returns an error only while no value has been loaded.
-- The version is polled every `WithPollInterval` (default 1s). The value is
-  also reloaded every `WithMaxAge` (default 5m, zero disables), which is the
-  only reload trigger when no version is configured.
-- A failed reload or version check keeps the previous value; see
-  `SnapshotStats`.
-- `Invalidate` forces a background reload, for example when an invalidation
-  message arrives.
+- The first `Get` loads the value, and concurrent first calls share the load.
+  `Get` returns an error only while no value has ever been loaded.
+- The version is read before the data, so a change made during a load is
+  picked up by the next poll.
+- The value is also reloaded every `WithMaxAge` (default five minutes), which
+  is the only trigger when no version is configured.
+- A failed reload or version check keeps the previous value.
+- `Invalidate` forces a background reload.
 
-## Loading
-
-`GetOrLoad` coalesces concurrent misses for a key into one loader call:
-
-- The loader runs on its own goroutine with a context that keeps the first
-  caller's values (trace IDs and so on) but not its cancellation. It is
-  canceled only after every waiting caller has given up, so one caller's
-  timeout does not fail the others.
-- A `Set`, `SetNX`, `CompareAndSwap`, `Add`, or `Delete` of the key while a
-  load is in flight keeps that load's result out of the store, so an
-  invalidation is never overwritten by data read before it. Callers still
-  receive the loaded value.
-- A loader panic is returned to every waiting caller as `*LoaderPanicError`
-  and does not block later loads of the key.
-- Values larger than `MaxCost` are returned but not stored.
-
-Options tune loading for an L1 cache in front of Redis or a database:
-
-| Option | Effect |
-| --- | --- |
-| `WithNegativeTTL(d)` | Stores an `ok=false` result for `d`, so lookups of a missing key stop reaching the loader. Errors are never cached. |
-| `WithLoadTimeout(d)` | Bounds each loader call. |
-| `WithStaleOnError(grace)` | Keeps expired entries for `grace`; if a reload fails, callers get the old value instead of the error. `Get` never returns expired values. |
-| `WithRefreshAhead(window)` | When a hit has less than `window` to live, reloads it in the background and returns the current value immediately. |
-| `WithTTLJitter(f)` | Lengthens each TTL by up to `f*TTL` so entries written together do not expire together. |
-
-```go
-banned := store.MustNew[int64, struct{}](
-	store.WithName("account_ban"),
-	store.WithNegativeTTL(30*time.Second), // most users are not banned
-	store.WithLoadTimeout(200*time.Millisecond),
-	store.WithStaleOnError(time.Minute),
-)
-```
+For a 400 KB JSON table read on every request, this replaces one large Redis
+read per request with one small version read per second per process.
 
 ## Invalidation across processes
 
-The `redisbus` subpackage (go-redis v8) keeps caches in several processes
-consistent. Each process creates one `Bus` on a shared channel and binds its
-caches under namespaces:
-
 ```go
-bus, _ := redisbus.New(redisClient, "ts_lobby:l1:invalidate")
+bus, _ := redisbus.New(redisClient, "myapp:l1:invalidate") // go-redis v8 UniversalClient
 defer bus.Close()
 
-users, _ := redisbus.BindStore(bus, "user_info", userStore) // keys: string or integer types
-libs, _ := redisbus.BindSnapshot(bus, "game_lib", gameLib)
+userBinding, _ := redisbus.BindStore(bus, "user_info", users) // string or integer keys
+libBinding, _ := redisbus.BindSnapshot(bus, "game_lib", gameLib)
 
-// After updating the database and the Redis copy:
-users.Invalidate(ctx, uid) // deletes locally, then in every other process
-libs.Invalidate(ctx)       // reloads everywhere
+// After the database and the Redis copy are updated:
+userBinding.Invalidate(ctx, uid) // deletes locally, then in every other process
+libBinding.Invalidate(ctx)       // reloads everywhere
 ```
 
-A process that writes data but holds no cache, such as an admin service,
-creates a `Bus` without binding anything (it never subscribes) and calls
+A process that writes data but caches nothing, such as an admin service,
+creates a `Bus`, binds nothing (so it never subscribes), and calls
 `bus.Publish(ctx, "user_info", "42")` or `bus.PublishAll(ctx, "game_lib")`.
 
-- Invalidate after the shared copy changes; invalidating first lets another
-  process reload the old value.
-- A process ignores its own messages; `Invalidate` has already applied them.
+- **Invalidate after the shared copy changes.** Invalidating first lets another
+  process reload the old value and keep it until its TTL.
 - Pub/sub delivers at most once. Whenever the subscription is established or
   re-established, the bus clears every bound store and reloads every bound
-  snapshot, so a disconnect cannot leave stale entries behind. Keep TTLs as a
-  final bound.
-- Only `PUBLISH` and `SUBSCRIBE` are used, so it works on Redis Cluster and
+  snapshot, so a disconnect cannot leave stale entries behind. Keep TTLs as the
+  final bound on staleness.
+- Only `PUBLISH` and `SUBSCRIBE` are used, so it works with Redis Cluster and
   ElastiCache Serverless.
 
-## Capacity control
+## Behavior notes
 
-Use `WithMaxCost` to bound a store by an application-defined cost. When the
-limit is exceeded, the store samples entries across its shards and removes the
-least recently accessed candidate.
-
-```go
-cache := store.MustNew[string, User](
-	store.WithMaxCost(10_000, func(_ string, _ User) int64 {
-		return 1
-	}),
-)
-```
-
-This is intentionally approximate: it avoids a global lock and the write
-amplification of an exact LRU list.
-
-## Value ownership
-
-Generic values follow normal Go assignment semantics. A struct value itself is
-copied, but maps, pointers, slices, and reference-bearing fields still share
-their backing data. Treat such values as immutable after insertion or provide
-your own synchronization. `Bytes` performs defensive copies on ordinary reads
-and writes.
-
-`GetUnsafeView` returns the store-owned byte slice without copying. Never
-modify it. A later replacement or deletion may make the view stale, so do not
-retain it longer than necessary.
-
-## TTL and cleanup
-
-A TTL greater than zero sets an expiry. Zero or negative TTL means the entry
-does not expire. TTLs use the monotonic clock, so wall-clock adjustments do not
-affect them. Expired values are never returned by `Get`. They are removed
-lazily on access and, when `WithCleanupInterval` is configured, by a background
-pass; with `WithStaleOnError`, only after the grace period. Call `Close` to
-stop that background goroutine.
+- **TTL**: a positive TTL sets an expiry; zero or negative means none. TTLs use
+  the monotonic clock. Expired entries are never returned by `Get`; they are
+  removed on access and by the optional `WithCleanupInterval` pass.
+- **Values are shared, not copied.** Treat maps, slices, and pointers stored in
+  a `Store` or returned by a `Snapshot` as read-only. `Bytes[K]` copies byte
+  slices on every read and write.
+- **Capacity**: `WithMaxCost` evicts by sampling a few entries per shard and
+  removing the least recently used. It is approximate by design and avoids a
+  global lock.
+- **Callbacks**: `WithEvictionCallback` runs synchronously after locks are
+  released; keep it fast.
 
 ## Metrics
 
-`Stats` reports hits, misses, cached-absence hits, loads, load errors, stale
-fallbacks, background refreshes, evictions, entries, and cost. Stores created
-`WithName`, and snapshots created with it, appear in `AllStats()`, and
-`PublishExpvar()` exposes them as the expvar variable `go_store`. Names must be
-unique among open stores and snapshots; `Close` releases them.
+`Store.Stats`, `Snapshot.Stats`, and `Bus.Stats` return counters (hits,
+misses, cached-absence hits, loads, load errors, stale fallbacks, refreshes,
+evictions, resets, and so on). Stores and snapshots created `WithName` are
+listed by `store.AllStats()`, and `store.PublishExpvar()` serves them as the
+expvar variable `go_store`.
 
-## Concurrency notes
+## Performance
 
-The top-level store is split into independently locked shards. Reads take a
-shard read lock; recency updates are atomic. Capacity eviction is sampled and
-does not maintain a globally locked LRU list. Eviction callbacks are called
-synchronously after internal locks are released, so callbacks should return
-quickly.
+Parallel reads on an Intel i5-14400F (16 threads), Go 1.26, zero allocations:
 
-No `unsafe` implementation is enabled: the standard-library comparable-key
-hash added in Go 1.24 provides safe generic sharding, and current benchmarks do
-not justify runtime-dependent memory tricks.
+| Operation | Time |
+| --- | --- |
+| `Store.Get` hit | ~25 ns |
+| `Store.GetOrLoad` hit | ~26 ns |
+| `Snapshot.Get` | <1 ns |
 
 ## Development
 
 ```sh
+go vet ./...
 go test ./...
 go test -race ./...
 go test -bench=. -benchmem ./...
-go vet ./...
 ```
 
 ## License

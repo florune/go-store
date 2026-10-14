@@ -198,6 +198,7 @@ func (s *Snapshot[T]) Invalidate() {
 	s.trigger(context.Background(), true, true)
 }
 
+// Stats returns the Snapshot's current statistics.
 func (s *Snapshot[T]) Stats() SnapshotStats {
 	st := SnapshotStats{Loads: s.loads.Load(), LoadErrors: s.loadErrs.Load(), VersionChecks: s.versionChecks.Load()}
 	if v := s.current.Load(); v != nil {

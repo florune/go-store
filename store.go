@@ -354,6 +354,7 @@ func (s *Store[K, V]) Len() int {
 	return n
 }
 
+// Stats returns the store's current statistics. Entries walks every shard.
 func (s *Store[K, V]) Stats() Stats {
 	return Stats{
 		Hits: s.hits.Load(), Misses: s.misses.Load(), Evictions: s.evictions.Load(),

@@ -116,6 +116,7 @@ func (b *Bus) publish(ctx context.Context, m message) error {
 	return nil
 }
 
+// Stats returns the Bus's current counters.
 func (b *Bus) Stats() Stats {
 	return Stats{
 		Published: b.published.Load(), Received: b.received.Load(),

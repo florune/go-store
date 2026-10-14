@@ -12,7 +12,9 @@ const defaultShards = 64
 type EvictionReason uint8
 
 const (
+	// Expired means the entry's TTL elapsed.
 	Expired EvictionReason = iota + 1
+	// Capacity means the entry was evicted to stay within WithMaxCost.
 	Capacity
 )
 
