@@ -58,6 +58,7 @@ func main() {
 - `Snapshot[T]`: one value loaded as a whole and kept current in the
   background.
 - `CompareAndSwap` and `Add`: atomic helpers for comparable and integer values.
+- `redisbus`: invalidation broadcast over Redis pub/sub for the above.
 
 Type parameters appear only on constructors such as `New[K, V]`. Options are
 plain values; `WithMaxCost` and `WithEvictionCallback` infer their types from
@@ -125,6 +126,38 @@ banned := store.MustNew[int64, struct{}](
 	store.WithStaleOnError(time.Minute),
 )
 ```
+
+## Invalidation across processes
+
+The `redisbus` subpackage (go-redis v8) keeps caches in several processes
+consistent. Each process creates one `Bus` on a shared channel and binds its
+caches under namespaces:
+
+```go
+bus, _ := redisbus.New(redisClient, "ts_lobby:l1:invalidate")
+defer bus.Close()
+
+users, _ := redisbus.BindStore(bus, "user_info", userStore) // keys: string or integer types
+libs, _ := redisbus.BindSnapshot(bus, "game_lib", gameLib)
+
+// After updating the database and the Redis copy:
+users.Invalidate(ctx, uid) // deletes locally, then in every other process
+libs.Invalidate(ctx)       // reloads everywhere
+```
+
+A process that writes data but holds no cache, such as an admin service,
+creates a `Bus` without binding anything (it never subscribes) and calls
+`bus.Publish(ctx, "user_info", "42")` or `bus.PublishAll(ctx, "game_lib")`.
+
+- Invalidate after the shared copy changes; invalidating first lets another
+  process reload the old value.
+- A process ignores its own messages; `Invalidate` has already applied them.
+- Pub/sub delivers at most once. Whenever the subscription is established or
+  re-established, the bus clears every bound store and reloads every bound
+  snapshot, so a disconnect cannot leave stale entries behind. Keep TTLs as a
+  final bound.
+- Only `PUBLISH` and `SUBSCRIBE` are used, so it works on Redis Cluster and
+  ElastiCache Serverless.
 
 ## Capacity control
 
