@@ -17,8 +17,17 @@ type entry[V any] struct {
 }
 
 type shard[K comparable, V any] struct {
-	mu    sync.RWMutex
-	items map[K]*entry[V]
+	mu      sync.RWMutex
+	items   map[K]*entry[V]
+	flights map[K]*flight[V]
+}
+
+// invalidateFlight keeps an in-flight load of key from storing its result,
+// which may predate the write being made. Callers hold sh.mu.
+func (sh *shard[K, V]) invalidateFlight(key K) {
+	if call := sh.flights[key]; call != nil {
+		call.stale = true
+	}
 }
 
 // Stats is a point-in-time snapshot of store activity.
@@ -46,8 +55,6 @@ type Store[K comparable, V any] struct {
 	loads     atomic.Uint64
 	loadErrs  atomic.Uint64
 
-	flightsMu sync.Mutex
-	flights   map[K]*flight[V]
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
@@ -64,10 +71,11 @@ func New[K comparable, V any](options ...Option[K, V]) (*Store[K, V], error) {
 	s := &Store[K, V]{
 		seed: maphash.MakeSeed(), shards: make([]shard[K, V], c.shards),
 		mask: uint64(c.shards - 1), maxCost: c.maxCost, costFn: c.cost,
-		onEvict: c.onEvict, flights: make(map[K]*flight[V]),
+		onEvict: c.onEvict,
 	}
 	for i := range s.shards {
 		s.shards[i].items = make(map[K]*entry[V])
+		s.shards[i].flights = make(map[K]*flight[V])
 	}
 	if c.cleanupInterval > 0 {
 		s.stop, s.done = make(chan struct{}), make(chan struct{})
@@ -100,26 +108,34 @@ func isExpired[V any](e *entry[V], now int64) bool {
 	return e.expiresAt > 0 && now >= e.expiresAt
 }
 
+func newEntry[V any](value V, ttl time.Duration, now, cost int64) *entry[V] {
+	e := &entry[V]{value: value, expiresAt: expiry(ttl, now), cost: cost}
+	e.accessed.Store(now)
+	return e
+}
+
+// costOf returns value's cost and whether it fits within MaxCost.
+func (s *Store[K, V]) costOf(key K, value V) (int64, bool) {
+	cost := int64(1)
+	if s.costFn != nil {
+		cost = max(s.costFn(key, value), 0)
+	}
+	return cost, s.maxCost <= 0 || cost <= s.maxCost
+}
+
 // Set stores value. A zero or negative TTL means no expiration. It returns
 // false without changing an existing value if the item alone exceeds MaxCost.
 func (s *Store[K, V]) Set(key K, value V, ttl time.Duration) bool {
-	cost := int64(1)
-	if s.costFn != nil {
-		cost = s.costFn(key, value)
-		if cost < 0 {
-			cost = 0
-		}
-	}
-	if s.maxCost > 0 && cost > s.maxCost {
+	cost, fits := s.costOf(key, value)
+	if !fits {
 		return false
 	}
-	now := time.Now().UnixNano()
-	e := &entry[V]{value: value, expiresAt: expiry(ttl, now), cost: cost}
-	e.accessed.Store(now)
+	e := newEntry(value, ttl, time.Now().UnixNano(), cost)
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	old := sh.items[key]
 	sh.items[key] = e
+	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	delta := cost
 	if old != nil {
@@ -132,14 +148,8 @@ func (s *Store[K, V]) Set(key K, value V, ttl time.Duration) bool {
 
 // SetNX stores value only when key has no live value.
 func (s *Store[K, V]) SetNX(key K, value V, ttl time.Duration) bool {
-	cost := int64(1)
-	if s.costFn != nil {
-		cost = s.costFn(key, value)
-		if cost < 0 {
-			cost = 0
-		}
-	}
-	if s.maxCost > 0 && cost > s.maxCost {
+	cost, fits := s.costOf(key, value)
+	if !fits {
 		return false
 	}
 	now := time.Now().UnixNano()
@@ -153,9 +163,8 @@ func (s *Store[K, V]) SetNX(key K, value V, ttl time.Duration) bool {
 		}
 		expired = current
 	}
-	e := &entry[V]{value: value, expiresAt: expiry(ttl, now), cost: cost}
-	e.accessed.Store(now)
-	sh.items[key] = e
+	sh.items[key] = newEntry(value, ttl, now, cost)
+	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	delta := cost
 	if expired != nil {
@@ -169,12 +178,22 @@ func (s *Store[K, V]) SetNX(key K, value V, ttl time.Duration) bool {
 
 // Get returns a live value and updates its recency.
 func (s *Store[K, V]) Get(key K) (V, bool) {
+	value, ok := s.lookup(key)
+	if ok {
+		s.hits.Add(1)
+	} else {
+		s.misses.Add(1)
+	}
+	return value, ok
+}
+
+// lookup is Get without hit and miss accounting.
+func (s *Store[K, V]) lookup(key K) (V, bool) {
 	sh := s.shardFor(key)
 	sh.mu.RLock()
 	e := sh.items[key]
 	if e == nil {
 		sh.mu.RUnlock()
-		s.misses.Add(1)
 		var zero V
 		return zero, false
 	}
@@ -182,14 +201,12 @@ func (s *Store[K, V]) Get(key K) (V, bool) {
 	if isExpired(e, now) {
 		sh.mu.RUnlock()
 		s.removeIfSame(key, e, Expired)
-		s.misses.Add(1)
 		var zero V
 		return zero, false
 	}
 	value := e.value
 	e.accessed.Store(now)
 	sh.mu.RUnlock()
-	s.hits.Add(1)
 	return value, true
 }
 
@@ -201,6 +218,7 @@ func (s *Store[K, V]) Delete(key K) bool {
 	if e != nil {
 		delete(sh.items, key)
 	}
+	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	if e != nil {
 		s.cost.Add(-e.cost)

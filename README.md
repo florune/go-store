@@ -59,6 +59,23 @@ func main() {
 - `Set[K, M]`: Redis-style typed member sets with a TTL per top-level key.
 - `CompareAndSwap` and `Add`: atomic helpers for comparable and integer values.
 
+## Loading
+
+`GetOrLoad` coalesces concurrent misses for a key into one loader call:
+
+- The loader runs on its own goroutine with a context that keeps the first
+  caller's values (trace IDs and so on) but not its cancellation. It is
+  canceled only after every waiting caller has given up, so one caller's
+  timeout does not fail the others.
+- A `Set`, `SetNX`, `CompareAndSwap`, `Add`, or `Delete` of the key while a
+  load is in flight keeps that load's result out of the store, so an
+  invalidation is never overwritten by data read before it. Callers still
+  receive the loaded value.
+- A loader panic is returned to every waiting caller as `*LoaderPanicError`
+  and does not block later loads of the key.
+- `ok=false` results and values larger than `MaxCost` are returned but not
+  stored.
+
 ## Capacity control
 
 Use `WithMaxCost` to bound a store by an application-defined cost. When the

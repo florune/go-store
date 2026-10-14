@@ -12,20 +12,13 @@ func CompareAndSwap[K comparable, V comparable](s *Store[K, V], key K, old, next
 		sh.mu.Unlock()
 		return false
 	}
-	cost := int64(1)
-	if s.costFn != nil {
-		cost = s.costFn(key, next)
-		if cost < 0 {
-			cost = 0
-		}
-	}
-	if s.maxCost > 0 && cost > s.maxCost {
+	cost, fits := s.costOf(key, next)
+	if !fits {
 		sh.mu.Unlock()
 		return false
 	}
-	replacement := &entry[V]{value: next, expiresAt: expiry(ttl, now), cost: cost}
-	replacement.accessed.Store(now)
-	sh.items[key] = replacement
+	sh.items[key] = newEntry(next, ttl, now, cost)
+	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	s.cost.Add(cost - e.cost)
 	s.enforceCapacity()
@@ -51,16 +44,9 @@ func Add[K comparable, V Integer](s *Store[K, V], key K, delta V, ttl time.Durat
 		}
 	}
 	value += delta
-	cost := int64(1)
-	if s.costFn != nil {
-		cost = s.costFn(key, value)
-		if cost < 0 {
-			cost = 0
-		}
-	}
-	e := &entry[V]{value: value, expiresAt: expiry(ttl, now), cost: cost}
-	e.accessed.Store(now)
-	sh.items[key] = e
+	cost, _ := s.costOf(key, value)
+	sh.items[key] = newEntry(value, ttl, now, cost)
+	sh.invalidateFlight(key)
 	sh.mu.Unlock()
 	s.cost.Add(cost - oldCost)
 	s.enforceCapacity()
