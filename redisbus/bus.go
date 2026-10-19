@@ -2,16 +2,19 @@
 // broadcasting invalidations over Redis pub/sub.
 //
 // Each process creates one Bus on a shared channel and binds its caches under
-// namespaces. Invalidating a key through a binding deletes it locally and
-// publishes a message; every other process deletes the key from its cache
-// bound under the same namespace. Processes that write data but hold no
-// cache, such as an admin service, call Publish directly.
+// namespaces. Create it with the subpackage for your client, goredisv9.New or
+// goredisv8.New; New takes any other client through Conn. Invalidating a key
+// through a binding deletes it locally and publishes a message; every other
+// process deletes the key from its cache bound under the same namespace.
+// Processes that write data but hold no cache, such as an admin service, call
+// Publish directly.
 //
 // Pub/sub delivers at most once: messages sent while a subscriber is
 // disconnected are lost. A Bus therefore clears every bound cache whenever
 // its subscription is (re)established, and cache TTLs remain the last line of
 // defense. Only PUBLISH and SUBSCRIBE are used, so the package works with
-// Redis Cluster and ElastiCache Serverless.
+// Redis Cluster and ElastiCache Serverless. Messages have the same format for
+// every client, so processes on different go-redis versions share a channel.
 package redisbus
 
 import (
@@ -23,25 +26,30 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-
-	"github.com/go-redis/redis/v8"
 )
 
-// receiveBuffer is large so that a burst of invalidations is not dropped by
-// go-redis, which discards messages when a subscriber falls behind.
-const receiveBuffer = 1024
+// Conn is the Redis connection a Bus runs on. Packages goredisv9 and
+// goredisv8 implement it for go-redis; implement it only for another client.
+type Conn interface {
+	// Publish sends payload on channel.
+	Publish(ctx context.Context, channel, payload string) error
+	// Subscribe subscribes to channel and, on a goroutine of its own, calls
+	// subscribed each time the subscription is established or re-established
+	// and message for each message received, one call at a time. Calling the
+	// returned stop ends the subscription; stop returns after the last call.
+	Subscribe(channel string, subscribed func(), message func(payload string)) (stop func() error)
+}
 
 // Bus publishes and receives cache invalidations on one Redis channel.
 type Bus struct {
-	client  redis.UniversalClient
+	conn    Conn
 	channel string
 	id      string
 
 	mu       sync.Mutex
 	handlers map[string]handler // guarded by mu
-	pubsub   *redis.PubSub      // guarded by mu; nil until the first bind
+	stop     func() error       // guarded by mu; nil until the first bind
 	closed   bool               // guarded by mu
-	done     chan struct{}
 
 	published, received, resets, dropped atomic.Uint64
 }
@@ -72,9 +80,9 @@ type Stats struct {
 
 // New returns a Bus on channel. It subscribes when the first cache is bound;
 // a Bus used only to Publish never subscribes.
-func New(client redis.UniversalClient, channel string) (*Bus, error) {
-	if client == nil {
-		return nil, errors.New("redisbus: client cannot be nil")
+func New(conn Conn, channel string) (*Bus, error) {
+	if conn == nil {
+		return nil, errors.New("redisbus: conn cannot be nil")
 	}
 	if channel == "" {
 		return nil, errors.New("redisbus: channel cannot be empty")
@@ -84,7 +92,7 @@ func New(client redis.UniversalClient, channel string) (*Bus, error) {
 		return nil, fmt.Errorf("redisbus: instance id: %w", err)
 	}
 	return &Bus{
-		client: client, channel: channel, id: hex.EncodeToString(id),
+		conn: conn, channel: channel, id: hex.EncodeToString(id),
 		handlers: make(map[string]handler),
 	}, nil
 }
@@ -109,7 +117,7 @@ func (b *Bus) publish(ctx context.Context, m message) error {
 	if err != nil {
 		return err
 	}
-	if err := b.client.Publish(ctx, b.channel, payload).Err(); err != nil {
+	if err := b.conn.Publish(ctx, b.channel, string(payload)); err != nil {
 		return fmt.Errorf("redisbus: publish %s: %w", m.NS, err)
 	}
 	b.published.Add(1)
@@ -132,14 +140,12 @@ func (b *Bus) Close() error {
 		return nil
 	}
 	b.closed = true
-	ps := b.pubsub
+	stop := b.stop
 	b.mu.Unlock()
-	if ps == nil {
+	if stop == nil {
 		return nil
 	}
-	err := ps.Close()
-	<-b.done
-	return err
+	return stop()
 }
 
 func (b *Bus) bind(namespace string, h handler) error {
@@ -155,27 +161,10 @@ func (b *Bus) bind(namespace string, h handler) error {
 		return fmt.Errorf("redisbus: namespace %q is already bound", namespace)
 	}
 	b.handlers[namespace] = h
-	if b.pubsub == nil {
-		ctx := context.Background()
-		b.pubsub = b.client.Subscribe(ctx, b.channel)
-		b.done = make(chan struct{})
-		go b.receive(b.pubsub.ChannelWithSubscriptions(ctx, receiveBuffer))
+	if b.stop == nil {
+		b.stop = b.conn.Subscribe(b.channel, b.reset, b.handle)
 	}
 	return nil
-}
-
-func (b *Bus) receive(ch <-chan interface{}) {
-	defer close(b.done)
-	for msg := range ch {
-		switch msg := msg.(type) {
-		case *redis.Subscription:
-			if msg.Kind == "subscribe" {
-				b.reset()
-			}
-		case *redis.Message:
-			b.handle(msg.Payload)
-		}
-	}
 }
 
 // reset clears every bound cache, since invalidations may have been missed

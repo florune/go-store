@@ -367,18 +367,44 @@ func PublishExpvar()           // publishes AllStats as expvar "go_store"; safe 
 import "github.com/florune/go-store/redisbus"
 ```
 
-Broadcasts invalidations over Redis pub/sub (go-redis v8). Uses only
-`PUBLISH` and `SUBSCRIBE`.
+Broadcasts invalidations over Redis pub/sub. Uses only `PUBLISH` and
+`SUBSCRIBE`. The package itself depends on no Redis client; create a bus with
+the subpackage for yours.
 
-### New
+### goredisv9.New, goredisv8.New
 
 ```go
-func New(client redis.UniversalClient, channel string) (*Bus, error)
+import "github.com/florune/go-store/redisbus/goredisv9" // github.com/redis/go-redis/v9
+func New(client redis.UniversalClient, channel string) (*redisbus.Bus, error)
+
+import "github.com/florune/go-store/redisbus/goredisv8" // github.com/go-redis/redis/v8
+func New(client redis.UniversalClient, channel string) (*redisbus.Bus, error)
 ```
 
-Creates a bus on `channel`. Every process that should share invalidations uses
-the same channel. The bus subscribes on the first bind; a bus that only
-publishes never subscribes.
+Creates a bus on `channel` through a `*redis.Client`, `*redis.ClusterClient` or
+other `UniversalClient`. Every process that should share invalidations uses
+the same channel; the message format is the same for both versions, so v8 and
+v9 processes can share one. The bus subscribes on the first bind; a bus that
+only publishes never subscribes.
+
+### New and Conn
+
+```go
+func New(conn Conn, channel string) (*Bus, error)
+
+type Conn interface {
+    Publish(ctx context.Context, channel, payload string) error
+    Subscribe(channel string, subscribed func(), message func(payload string)) (stop func() error)
+}
+```
+
+For a Redis client other than go-redis. `Subscribe` calls `subscribed` each
+time the subscription is established or re-established and `message` for each
+message, one call at a time on a goroutine of its own; `stop` ends the
+subscription and returns after the last call.
+
+Migrating from v0.1: `redisbus.New(client, channel)` becomes
+`goredisv8.New(client, channel)`.
 
 ### Bus methods
 
