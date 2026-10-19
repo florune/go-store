@@ -318,15 +318,34 @@ func PublishExpvar()           // 把 AllStats 发布为 expvar 变量 "go_store
 import "github.com/florune/go-store/redisbus"
 ```
 
-通过 Redis Pub/Sub（go-redis v8）广播失效消息，只用到 `PUBLISH` 和 `SUBSCRIBE`。
+通过 Redis Pub/Sub 广播失效消息，只用到 `PUBLISH` 和 `SUBSCRIBE`。这个包本身不依赖任何 Redis 客户端，用对应客户端的子包创建 Bus。
 
-### New
+### goredisv9.New、goredisv8.New
 
 ```go
-func New(client redis.UniversalClient, channel string) (*Bus, error)
+import "github.com/florune/go-store/redisbus/goredisv9" // github.com/redis/go-redis/v9
+func New(client redis.UniversalClient, channel string) (*redisbus.Bus, error)
+
+import "github.com/florune/go-store/redisbus/goredisv8" // github.com/go-redis/redis/v8
+func New(client redis.UniversalClient, channel string) (*redisbus.Bus, error)
 ```
 
-在 `channel` 上创建一个 Bus。需要共享失效消息的所有进程使用同一个频道。第一次绑定时才订阅；只发布的 Bus 永远不会订阅。
+通过 `*redis.Client`、`*redis.ClusterClient` 或其他 `UniversalClient` 在 `channel` 上创建一个 Bus。需要共享失效消息的所有进程使用同一个频道；两个版本的消息格式相同，v8 和 v9 的进程可以共用一个频道。第一次绑定时才订阅；只发布的 Bus 永远不会订阅。
+
+### New 与 Conn
+
+```go
+func New(conn Conn, channel string) (*Bus, error)
+
+type Conn interface {
+    Publish(ctx context.Context, channel, payload string) error
+    Subscribe(channel string, subscribed func(), message func(payload string)) (stop func() error)
+}
+```
+
+用于 go-redis 以外的 Redis 客户端。`Subscribe` 在自己的 goroutine 上逐个回调：每次订阅建立或重新建立时调用 `subscribed`，每收到一条消息调用 `message`；`stop` 结束订阅，并在最后一次回调返回后才返回。
+
+从 v0.1 迁移：`redisbus.New(client, channel)` 改为 `goredisv8.New(client, channel)`。
 
 ### Bus 的方法
 

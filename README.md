@@ -103,7 +103,8 @@ read per request with one small version read per second per process.
 ## Invalidation across processes
 
 ```go
-bus, _ := redisbus.New(redisClient, "myapp:l1:invalidate") // go-redis v8 UniversalClient
+// go-redis v9 (github.com/redis/go-redis/v9); use goredisv8.New for v8.
+bus, _ := goredisv9.New(redisClient, "myapp:l1:invalidate")
 defer bus.Close()
 
 userBinding, _ := redisbus.BindStore(bus, "user_info", users) // string or integer keys
@@ -120,6 +121,9 @@ creates a `Bus`, binds nothing (so it never subscribes), and calls
 
 - **Invalidate after the shared copy changes.** Invalidating first lets another
   process reload the old value and keep it until its TTL.
+- Pick the subpackage matching your client: `redisbus/goredisv9` or
+  `redisbus/goredisv8`. Only the one you import is compiled in, and processes
+  on different versions share a channel.
 - Pub/sub delivers at most once. Whenever the subscription is established or
   re-established, the bus clears every bound store and reloads every bound
   snapshot, so a disconnect cannot leave stale entries behind. Keep TTLs as the

@@ -82,7 +82,8 @@ libs, err := gameLib.Get(ctx) // 读内存；返回的切片是共享的，不�
 ## 跨进程失效
 
 ```go
-bus, _ := redisbus.New(redisClient, "myapp:l1:invalidate") // go-redis v8 的 UniversalClient
+// go-redis v9（github.com/redis/go-redis/v9）；v8 用 goredisv8.New
+bus, _ := goredisv9.New(redisClient, "myapp:l1:invalidate")
 defer bus.Close()
 
 userBinding, _ := redisbus.BindStore(bus, "user_info", users) // key 为字符串或整数类型
@@ -96,6 +97,7 @@ libBinding.Invalidate(ctx)       // 所有进程重新加载
 只写数据、不持有缓存的进程（比如 admin 后台）创建一个 `Bus`，不做任何绑定（因此不会订阅），直接调用 `bus.Publish(ctx, "user_info", "42")` 或 `bus.PublishAll(ctx, "game_lib")`。
 
 - **一定要在共享数据更新之后再失效。** 顺序反了，其他进程可能重新加载到旧值，并一直保留到 TTL 过期。
+- 按你用的客户端选子包：`redisbus/goredisv9` 或 `redisbus/goredisv8`。只有你导入的那个会被编译进来，不同版本的进程可以共用同一个频道。
 - Pub/Sub 至多投递一次。每当订阅建立或重新建立时，Bus 会清空所有绑定的 Store、重新加载所有绑定的 Snapshot，所以断线期间丢失的消息不会留下脏数据。TTL 仍然是数据过时时间的最终上限。
 - 只用到 `PUBLISH` 和 `SUBSCRIBE`，兼容 Redis Cluster 和 ElastiCache Serverless。
 
